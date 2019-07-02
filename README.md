@@ -9,7 +9,8 @@ The code has been tested on Python 3.6+PyTorch 0.3 and Python 3.6+PyTorch 0.41. 
 python main.py --source=mnist --recordfolder=agnostic_disentangle --gpu=0
 ```
 
-The poster of this paper can be found with the link: [poster]('img/DAL_ICML2019_Poster.pdf')
+The poster of this paper can be found with the link: [poster](https://cs-people.bu.edu/xpeng/pdfs/DAL_ICML2019_Poster.pdf)
+
 The **Oral** presentation of this paper in ICML2019 can be found with the link: [Oral Presentation](https://slideslive.com/38917425/transfer-and-multitask-learning)
 
 ## Citation
