@@ -3,6 +3,11 @@
 
 PyTorch implementation for **Domain agnostic learning with disentangled representations**.
 
+The code has been tested on Python 3.6+PyTorch 0.3 and Python 3.6+PyTorch 0.41. To run the training and testing code, use the following script:
+
+```
+python main.py --source=mnist --recordfolder=agnostic_disentangle --gpu=0
+```
 
 ## Citation
 If you use this code for your research, please cite our [paper](http://proceedings.mlr.press/v97/peng19b/peng19b.pdf):
