@@ -229,8 +229,8 @@ class Solver(object):
             loss.backward()
             self.group_step([self.opt_fd, self.opt_d1, self.opt_g])
 
-            src_domain_pred = self.FD(self.D1(self.G(img_t)))
-            tgt_domain_pred = self.FD(self.D1(self.G(img_s)))
+            src_domain_pred = self.FD(self.D1(self.G(img_s)))
+            tgt_domain_pred = self.FD(self.D1(self.G(img_t)))
 
             df_loss_src = adv_loss(src_domain_pred, 1-self.src_domain_code)
             df_loss_tgt = adv_loss(tgt_domain_pred, 1-self.tgt_domain_code)
