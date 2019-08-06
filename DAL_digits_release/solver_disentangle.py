@@ -193,7 +193,7 @@ class Solver(object):
 
 
 
-            # max mutual information between (d0, d2) and (d1, d2)
+            # minimize mutual information between (d0, d2) and (d1, d2)
             for i in range(0, self.mi_k):
                 output_d0_s, output_d0_t = self.D0(self.G(img_s)), self.D0(self.G(img_t))
                 output_d1_s, output_d1_t = self.D1(self.G(img_s)), self.D1(self.G(img_t))
@@ -205,7 +205,7 @@ class Solver(object):
                 MI_d0d2_t = self.mutual_information_estimator(output_d0_t, output_d2_t, output_d2_t_shuffle)
                 MI_d1d2_s = self.mutual_information_estimator(output_d1_s, output_d2_s, output_d2_s_shuffle)
                 MI_d1d2_t = self.mutual_information_estimator(output_d1_t, output_d2_t, output_d2_t_shuffle)
-                MI = -0.25*(MI_d0d2_s + MI_d0d2_t + MI_d1d2_s + MI_d1d2_t) * self.mi_para
+                MI = 0.25*(MI_d0d2_s + MI_d0d2_t + MI_d1d2_s + MI_d1d2_t) * self.mi_para
                 MI.backward()
                 self.group_step([self.opt_d0, self.opt_d1, self.opt_d2, self.opt_mi])
             # pred_d1d2_s = self.M(output_d1_s, output_d2_s)
