@@ -24,6 +24,7 @@ class Feature_base(nn.Module):
         # x = F.dropout(x, training=self.training)
         return x
 
+
 class Feature_disentangle(nn.Module):
     def __init__(self):
         super(Feature_disentangle, self).__init__()
@@ -36,6 +37,7 @@ class Feature_disentangle(nn.Module):
         x = F.dropout(x, training=self.training)
         x = F.relu(self.bn2_fc(self.fc2(x)))
         return x
+
 
 class Feature_discriminator(nn.Module):
     def __init__(self):
@@ -56,6 +58,7 @@ class Reconstructor(nn.Module):
         x = self.fc(x)
         return x
 
+
 class Mine(nn.Module):
     def __init__(self):
         super(Mine, self).__init__()
@@ -66,6 +69,7 @@ class Mine(nn.Module):
         h1 = F.leaky_relu(self.fc1_x(x)+self.fc1_y(y))
         h2 = self.fc2(h1)
         return h2
+
 
 class Predictor(nn.Module):
     def __init__(self, prob=0.5):
