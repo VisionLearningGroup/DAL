@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.io import loadmat
 
-base_dir = './data'
+base_dir = './data/Digit-Five'
 def load_mnistm(scale=True, usps=False, all_use=False):
     mnistm_data = loadmat(base_dir + '/mnistm_with_label.mat')
     mnistm_train = mnistm_data['train']
@@ -16,7 +16,7 @@ def load_mnistm(scale=True, usps=False, all_use=False):
     mnistm_train = mnistm_train[inds]
     train_label = train_label[inds]
     test_label = np.argmax(mnistm_labels_test, axis=1)
-    
+
     # mnistm_train = mnistm_train[:25000]
     # train_label = train_label[:25000]
     # mnistm_test = mnistm_test[:9000]

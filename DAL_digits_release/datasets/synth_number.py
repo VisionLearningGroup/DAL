@@ -5,7 +5,7 @@ import sys
 sys.path.append('../utils/')
 from utils.utils import dense_to_one_hot
 
-base_dir = './data'
+base_dir = './data/Digit-Five'
 
 def load_syn(scale=True, usps=False, all_use=False):
     syn_train = loadmat(base_dir + '/synth_train_28x28.mat')

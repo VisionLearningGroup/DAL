@@ -5,7 +5,7 @@ import pickle
 import sys
 sys.path.append('../utils/')
 from utils.utils import dense_to_one_hot
-base_dir = './data'
+base_dir = './data/Digit-Five'
 
 def load_usps(all_use=False):
     dataset  = loadmat(base_dir + '/usps_28x28.mat')
@@ -17,7 +17,7 @@ def load_usps(all_use=False):
     inds = np.random.permutation(img_train.shape[0])
     img_train = img_train[inds]
     label_train = label_train[inds]
-    
+
     img_train = img_train * 255
     img_test = img_test * 255
     img_train = img_train.reshape((img_train.shape[0], 1, 28, 28))
@@ -27,7 +27,7 @@ def load_usps(all_use=False):
     label_test = dense_to_one_hot(label_test)
     img_train = np.concatenate([ img_train, img_train, img_train], 1)
     img_test = np.concatenate([img_test, img_test,img_test],1)
-    
+
     print('usps train X shape->',  img_train.shape)
     print('usps train y shape->',  label_train.shape)
     print('usps test X shape->',  img_test.shape)

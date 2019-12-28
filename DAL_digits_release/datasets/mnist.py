@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.io import loadmat
 
-base_dir = './data'
+base_dir = './data/Digit-Five'
 def load_mnist(scale=True, usps=False, all_use=False):
     mnist_data = loadmat(base_dir + '/mnist_data.mat')
     if scale:
@@ -31,7 +31,7 @@ def load_mnist(scale=True, usps=False, all_use=False):
     mnist_train = mnist_train[inds]
     train_label = train_label[inds]
     test_label = np.argmax(mnist_labels_test, axis=1)
-    
+
     print('mnist train X shape->',  mnist_train.shape)
     print('mnist train y shape->',  train_label.shape)
     print('mnist test X shape->',  mnist_test.shape)

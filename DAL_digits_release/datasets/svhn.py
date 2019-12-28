@@ -4,8 +4,8 @@ import sys
 
 sys.path.append('./utils/')
 from utils.utils import dense_to_one_hot
-from scipy.misc import imresize
-base_dir = './data'
+# from scipy.misc import imresize
+base_dir = './data/Digit-Five'
 def load_svhn():
     svhn_train = loadmat(base_dir + '/svhn_train_28x28.mat')
     svhn_test = loadmat(base_dir + '/svhn_test_28x28.mat')

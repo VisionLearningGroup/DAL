@@ -1,292 +1,359 @@
 from __future__ import print_function
 import torch
 import sys
+import os
 sys.path.append('./model')
 sys.path.append('./datasets')
 sys.path.append('./metric')
 print(sys.path)
 
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
-from model.build_gen import *
+from model.build_gen import Disentangler, Generator, Classifier, Feature_Discriminator, Reconstructor, Mine
 from datasets.dataset_read import dataset_read
-import numpy as np
+from utils.utils import _l2_rec, _ent, _discrepancy, _ring
 
+from torch.utils.tensorboard import SummaryWriter
+from time import gmtime, strftime
+from tqdm import tqdm
 
-class Solver(object):
+class Solver():
     def __init__(self, args, batch_size=64, source='svhn',
-                 target='mnist', learning_rate=0.0002, interval=100, optimizer='adam'
-                 , num_k=4, all_use=False, checkpoint_dir=None, save_epoch=10):
+                 target='mnist', learning_rate=0.0002, interval=10,
+                 optimizer='adam', num_k=4, all_use=False,
+                 checkpoint_dir=None, save_epoch=10):
+
+        timestring = strftime("%Y-%m-%d_%H-%M-%S", gmtime()) + "_%s" % args.exp_name
+        self.logdir = os.path.join('./logs', timestring)
+        self.logger = SummaryWriter(log_dir=self.logdir)
+
         self.src_domain_code = np.repeat(np.array([[*([1]), *([0])]]), batch_size, axis=0)
-        self.tgt_domain_code = np.repeat(np.array([[*([0]), *([1])]]), batch_size, axis=0)
+        self.trg_domain_code = np.repeat(np.array([[*([0]), *([1])]]), batch_size, axis=0)
         self.src_domain_code = Variable(torch.FloatTensor(self.src_domain_code).cuda(), requires_grad=False)
-        self.tgt_domain_code = Variable(torch.FloatTensor(self.tgt_domain_code).cuda(), requires_grad=False)
+        self.trg_domain_code = Variable(torch.FloatTensor(self.trg_domain_code).cuda(), requires_grad=False)
         self.batch_size = batch_size
 
         self.source = source
         self.target = target
         self.num_k = num_k
-        self.mi_k  = 1
+        self.mi_k = 1
         self.checkpoint_dir = checkpoint_dir
         self.save_epoch = save_epoch
         self.use_abs_diff = args.use_abs_diff
         self.all_use = all_use
-        self.belta = 0.01
-        self.mi_para = 0.0001
+        self.delta = 0.01
+        self.mi_coeff = 0.0001
         if self.source == 'svhn':
             self.scale = False
         else:
             self.scale = False
         print('dataset loading')
-        self.datasets, self.dataset_test = dataset_read(source, target, self.batch_size, scale=self.scale,
-                                                        all_use=self.all_use)
+        self.datasets, self.dataset_test = dataset_read(
+            source, target, self.batch_size, scale=self.scale, all_use=self.all_use)
         print('load finished!')
-        self.G = Generator(source=source, target=target)
-        self.D0 = Disentangler()
-        self.D1 = Disentangler()
-        self.D2 = Disentangler()
 
-        self.C0 = Classifier(source=source, target=target)
-        self.C1 = Classifier(source=source, target=target)
-        self.C2 = Classifier(source=source, target=target)
+        self.G = Generator(source=source, target=target)
         self.FD = Feature_Discriminator()
         self.R = Reconstructor()
-        # Mutual information network estimation
-        self.M = Mine()
+        self.MI = Mine()
+
+        self.C = nn.ModuleDict({
+            'ds': Classifier(source=source, target=target),
+            'di': Classifier(source=source, target=target),
+            'ci': Classifier(source=source, target=target)
+        })
+
+        self.D = nn.ModuleDict({
+            'ds': Disentangler(), 'di': Disentangler(), 'ci': Disentangler()})
+
+        # All modules in the same dict
+        self.modules = nn.ModuleDict({
+            'G': self.G, 'FD': self.FD, 'R': self.R, 'MI': self.MI
+        })
 
         if args.eval_only:
-            self.G.torch.load(
-                '%s/%s_to_%s_model_epoch%s_G.pt' % (self.checkpoint_dir, self.source, self.target, args.resume_epoch))
-            self.G.torch.load(
-                '%s/%s_to_%s_model_epoch%s_G.pt' % (
-                    self.checkpoint_dir, self.source, self.target, self.checkpoint_dir, args.resume_epoch))
-            self.G.torch.load(
-                '%s/%s_to_%s_model_epoch%s_G.pt' % (self.checkpoint_dir, self.source, self.target, args.resume_epoch))
-
-        self.G.cuda()
-        self.C0.cuda()
-        self.C1.cuda()
-        self.C2.cuda()
-
-        self.D0.cuda()
-        self.D1.cuda()
-        self.D2.cuda()
-        self.FD.cuda()
-        self.R.cuda()
-        self.M.cuda()
+            self.G.torch.load('%s/%s_to_%s_model_epoch%s_G.pt' % (
+                self.checkpoint_dir, self.source, self.target, args.resume_epoch))
+            self.G.torch.load('%s/%s_to_%s_model_epoch%s_G.pt' % (
+                self.checkpoint_dir, self.source, self.target, args.resume_epoch))
+            self.G.torch.load('%s/%s_to_%s_model_epoch%s_G.pt' % (
+                self.checkpoint_dir, self.source, self.target, args.resume_epoch))
 
         self.interval = interval
-
-        self.set_optimizer(which_opt=optimizer, lr=learning_rate)
         self.lr = learning_rate
+        self.xent_loss = nn.CrossEntropyLoss().cuda()
+        self.adv_loss = nn.BCEWithLogitsLoss().cuda()
+        self.set_optimizer(which_opt=optimizer, lr=learning_rate)
+        self.to_device()
+
+    def to_device(self):
+        for k, v in self.modules.items():
+            self.modules[k] = v.cuda()
+
+        for k, v in self.C.items():
+            self.C[k] = v.cuda()
+
+        for k, v in self.D.items():
+            self.D[k] = v.cuda()
 
     def set_optimizer(self, which_opt='adam', lr=0.001, momentum=0.9):
-        self.opt_g = optim.Adam(self.G.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_c0 = optim.Adam(self.C0.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_c1 = optim.Adam(self.C1.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_c2 = optim.Adam(self.C2.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_d0 = optim.Adam(self.D0.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_d1 = optim.Adam(self.D1.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_d2 = optim.Adam(self.D2.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_fd = optim.Adam(self.FD.parameters(),lr=lr, weight_decay=0.0005)
-        self.opt_r  = optim.Adam(self.R.parameters(), lr=lr, weight_decay=0.0005)
-        self.opt_mi = optim.Adam(self.M.parameters(), lr=lr, weight_decay=0.0005)
+        self.opt = {
+            'C_ds': optim.Adam(self.C['ds'].parameters(), lr=lr, weight_decay=5e-4),
+            'C_di': optim.Adam(self.C['di'].parameters(), lr=lr, weight_decay=5e-4),
+            'C_ci': optim.Adam(self.C['ci'].parameters(), lr=lr, weight_decay=5e-4),
+            'D_ds': optim.Adam(self.D['ds'].parameters(), lr=lr, weight_decay=5e-4),
+            'D_di': optim.Adam(self.D['di'].parameters(), lr=lr, weight_decay=5e-4),
+            'D_ci': optim.Adam(self.D['ci'].parameters(), lr=lr, weight_decay=5e-4),
+            'G': optim.Adam(self.G.parameters(), lr=lr, weight_decay=5e-4),
+            'FD': optim.Adam(self.FD.parameters(), lr=lr, weight_decay=5e-4),
+            'R': optim.Adam(self.R.parameters(), lr=lr, weight_decay=5e-4),
+            'MI': optim.Adam(self.MI.parameters(), lr=lr, weight_decay=5e-4),
+        }
 
     def reset_grad(self):
-        self.opt_g.zero_grad()
-        self.opt_c0.zero_grad()
-        self.opt_c1.zero_grad()
-        self.opt_c2.zero_grad()
-        self.opt_d0.zero_grad()
-        self.opt_d1.zero_grad()
-        self.opt_d2.zero_grad()
-        self.opt_fd.zero_grad()
-        self.opt_r.zero_grad()
-        self.opt_mi.zero_grad()
+        for _, opt in self.opt.items():
+            opt.zero_grad()
 
-    def ent(self, output):
-        return - torch.mean(torch.log(F.softmax(output + 1e-6)))
-
-    def discrepancy(self, out1, out2):
-
-        return torch.mean(torch.abs(F.softmax(out1) - F.softmax(out2)))
-
-    def mutual_information_estimator(self, x, y, y_):
-        joint, marginal = self.M(x, y), self.M(x, y_)
+    def mi_estimator(self, x, y, y_):
+        joint, marginal = self.MI(x, y), self.MI(x, y_)
         return torch.mean(joint) - torch.log(torch.mean(torch.exp(marginal)))
 
-    def reconstruct_loss(self,src,tgt):
-        return torch.sum((src-tgt)**2) / (src.shape[0]*src.shape[1])
-
-    def group_step(self, step_list):
-        for i in range(len(step_list)):
-            step_list[i].step()
+    def group_opt_step(self, opt_keys):
+        for k in opt_keys:
+            self.opt[k].step()
         self.reset_grad()
 
-    def ring_loss(self, feat, type='geman'):
-        x = feat.pow(2).sum(dim=1).pow(0.5)
-        radius = x.mean()
-        radius = radius.expand_as(x)
-        # print(radius)
-        if type=='geman':
-            l2_loss = (x-radius).pow(2).sum(dim=0) / (x.shape[0]*0.5)
-            return l2_loss
+    def optimize_classifier(self, img_src, label_src):
+        feat_src = self.G(img_src)
+        _loss = dict()
+        for key in ['ds', 'di', 'ci']:
+            _loss['class_src_' + key] = self.xent_loss(
+                self.C[key](self.D[key](feat_src)), label_src)
 
-    def train(self, epoch, record_file=None):
-        criterion = nn.CrossEntropyLoss().cuda()
-        adv_loss = nn.BCEWithLogitsLoss().cuda()
-        self.G.train()
-        self.D0.train()
-        self.D1.train()
-        self.D2.train()
-        self.C0.train()
-        self.C1.train()
-        self.C2.train()
-        self.FD.train()
-        self.R.train()
-        self.M.train()
+        _sum_loss = sum([l for _, l in _loss.items()])
+        _sum_loss.backward()
+        self.group_opt_step(['G', 'C_ds', 'C_di', 'C_ci', 'D_ds', 'D_di', 'D_ci'])
+        return _loss
+
+    def discrepancy_minimizer(self, img_src, img_trg, label_src):
+        # ================================== #
+        # NOTE: I'm still not sure why we need this
+        feat_src = self.G(img_src)
+        feat_trg = self.G(img_trg)
+
+        _loss = dict()
+        # on source domain
+        _loss['ds_src'] = self.xent_loss(
+            self.C['ds'](self.D['ds'](feat_src)), label_src)
+        _loss['di_src'] = self.xent_loss(
+            self.C['di'](self.D['di'](feat_src)), label_src)
+
+        # on target domain
+        _loss['discrepancy_ds_di_trg'] = _discrepancy(
+            self.C['ds'](self.D['ds'](feat_trg)),
+            self.C['di'](self.D['di'](feat_trg)))
+
+        _sum_loss = sum([l for _, l in _loss.items()])
+        _sum_loss.backward()
+        self.group_opt_step(['D_ds', 'D_di', 'C_ds', 'C_di'])
+        return _loss
+
+    def ring_loss_minimizer(self, img_src, img_trg):
+        data = torch.cat((img_src, img_trg), 0)
+        feat = self.G(data)
+        ring_loss = _ring(feat)
+        ring_loss.backward()
+        self.group_opt_step(['G'])
+        return ring_loss
+
+    def mutual_information_minimizer(self, img_src, img_trg):
+        # minimize mutual information between (ds, ci) and (di, ci)
+        for i in range(0, self.mi_k):
+            feat_src, feat_trg = self.G(img_src), self.G(img_trg)
+            ds_src, ds_trg = self.D['ds'](feat_src), self.D['ds'](feat_trg)
+            di_src, di_trg = self.D['di'](feat_src), self.D['di'](feat_trg)
+            ci_src, ci_trg = self.D['ci'](feat_src), self.D['ci'](feat_trg)
+
+            ci_src_shuffle = torch.index_select(
+                ci_src, 0, Variable(torch.randperm(ci_src.shape[0]).cuda()))
+            ci_trg_shuffle = torch.index_select(
+                ci_trg, 0, Variable(torch.randperm(ci_trg.shape[0]).cuda()))
+
+            MI_ds_ci_src = self.mi_estimator(ds_src, ci_src, ci_src_shuffle)
+            MI_ds_ci_trg = self.mi_estimator(ds_trg, ci_trg, ci_trg_shuffle)
+            MI_di_ci_src = self.mi_estimator(di_src, ci_src, ci_src_shuffle)
+            MI_di_ci_trg = self.mi_estimator(di_trg, ci_trg, ci_trg_shuffle)
+
+            MI = 0.25 * (MI_ds_ci_src + MI_ds_ci_trg + MI_di_ci_src + MI_di_ci_trg) * self.mi_coeff
+            MI.backward()
+            self.group_opt_step(['D_ds', 'D_di', 'D_ci', 'MI'])
+        # pred_di_ci_src = self.M(out_di_src, out_ci_src)
+
+    def class_confusion(self, img_src, img_trg):
+        # - adversarial training
+
+        # f_ci = CI(G(im)) extracts features that are class irrelevant
+        # by maximizing the entropy, given that the classifier is fixed
+        _loss = dict()
+        _loss['src_ci'] = _ent(self.C['ci'](self.D['ci'](self.G(img_src))))
+        _loss['trg_ci'] = _ent(self.C['ci'](self.D['ci'](self.G(img_trg))))
+        _sum_loss = sum([l for _, l in _loss.items()])
+        _sum_loss.backward()
+        self.group_opt_step(['D_ci', 'G'])
+        return _loss
+
+    def adversarial_alignment(self, img_src, img_trg):
+
+        # FD should guess if the features extracted f_di = DI(G(im))
+        # are from target or source domain. To win this game and fool FD,
+        # DI should extract domain invariant features.
+
+        # Loss measures features' ability to fool the discriminator
+        src_domain_pred = self.FD(self.D['di'](self.G(img_src)))
+        tgt_domain_pred = self.FD(self.D['di'](self.G(img_trg)))
+        df_loss_src = self.adv_loss(src_domain_pred, self.src_domain_code)
+        df_loss_trg = self.adv_loss(tgt_domain_pred, self.trg_domain_code)
+        alignment_loss1 = 0.01 * (df_loss_src + df_loss_trg)
+        alignment_loss1.backward()
+        self.group_opt_step(['FD', 'D_di', 'G'])
+
+        # Measure discriminator's ability to classify source from target samples
+        src_domain_pred = self.FD(self.D['di'](self.G(img_src)))
+        tgt_domain_pred = self.FD(self.D['di'](self.G(img_trg)))
+        df_loss_src = self.adv_loss(src_domain_pred, 1 - self.src_domain_code)
+        df_loss_trg = self.adv_loss(tgt_domain_pred, 1 - self.trg_domain_code)
+        alignment_loss2 = 0.01 * (df_loss_src + df_loss_trg)
+        alignment_loss2.backward()
+        self.group_opt_step(['FD', 'D_di', 'G'])
+
+        for _ in range(self.num_k):
+            loss_dis = _discrepancy(
+                self.C['ds'](self.D['ds'](self.G(img_trg))),
+                self.C['di'](self.D['di'](self.G(img_trg))))
+            loss_dis.backward()
+            self.group_opt_step(['G'])
+        return alignment_loss1, alignment_loss2, loss_dis
+
+    def optimize_rec(self, img_src, img_trg):
+        _feat_src = self.G(img_src)
+        _feat_trg = self.G(img_trg)
+
+        feat_src, feat_trg = dict(), dict()
+        rec_src, rec_trg = dict(), dict()
+        for k in ['ds', 'di', 'ci']:
+            feat_src[k] = self.D[k](_feat_src)
+            feat_trg[k] = self.D[k](_feat_trg)
+
+        recon_loss = None
+        rec_loss_src, rec_loss_trg = dict(), dict()
+        for k1, k2 in [('ds', 'ci'), ('di', 'ci')]:
+            k = '%s_%s' % (k1, k2)
+            rec_src[k] = self.R(torch.cat([feat_src[k1], feat_src[k2]], 1))
+            rec_trg[k] = self.R(torch.cat([feat_trg[k1], feat_trg[k2]], 1))
+            rec_loss_src[k] = _l2_rec(rec_src[k], _feat_src)
+            rec_loss_trg[k] = _l2_rec(rec_trg[k], _feat_trg)
+
+            if recon_loss is None:
+                recon_loss = rec_loss_src[k] + rec_loss_trg[k]
+            else:
+                recon_loss += rec_loss_src[k] + rec_loss_trg[k]
+
+        recon_loss = (recon_loss / 4) * self.delta
+        recon_loss.backward()
+        self.group_opt_step(['D_di', 'D_ci', 'D_ds', 'R'])
+        return rec_loss_src, rec_loss_trg
+
+    def train_epoch(self, epoch, record_file=None):
+        # set training
+        for k in self.modules.keys():
+            self.modules[k].train()
+        for k in self.C.keys():
+            self.C[k].train()
+        for k in self.D.keys():
+            self.D[k].train()
+
         torch.cuda.manual_seed(1)
+        total_batches = 500000
+        pbar_descr_prefix = "Epoch %d" % (epoch)
+        with tqdm(total=total_batches, ncols=80, dynamic_ncols=False,
+                  desc=pbar_descr_prefix) as pbar:
+            for batch_idx, data in enumerate(self.datasets):
+                if batch_idx > total_batches:
+                    return batch_idx
 
-        for batch_idx, data in enumerate(self.datasets):
-            img_t = data['T']
-            img_s = data['S']
-            label_s = data['S_label']
-            if img_s.size()[0] < self.batch_size or img_t.size()[0] < self.batch_size:
-                break
-            img_s = img_s.cuda()
-            img_t = img_t.cuda()
-            imgs = Variable(torch.cat((img_s,\
-                                       img_t), 0))
-            label_s = Variable(label_s.long().cuda())
+                img_trg = data['T']
+                img_src = data['S']
+                label_src = data['S_label']
+                if img_src.size()[0] < self.batch_size or img_trg.size()[0] < self.batch_size:
+                    break
+                img_src = img_src.cuda()
+                img_trg = img_trg.cuda()
+                label_src = Variable(label_src.long().cuda())
+                img_src = Variable(img_src)
+                img_trg = Variable(img_trg)
+                self.reset_grad()
 
-            img_s = Variable(img_s)
-            img_t = Variable(img_t)
-            self.reset_grad()
+                # ================================== #
+                class_loss = self.optimize_classifier(img_src, label_src)
+                ring_loss = self.ring_loss_minimizer(img_src, img_trg)
+                self.mutual_information_minimizer(img_src, img_trg)
+                confusion_loss = self.class_confusion(img_src, img_trg)
+                (alignment_loss1, alignment_loss2, discrepancy_loss) = self.adversarial_alignment(
+                    img_src, img_trg)
+                rec_loss_src, rec_loss_trg = self.optimize_rec(img_src, img_trg)
+                # ================================== #
 
-            # first step: train three disentangler
-            feat_s = self.G(img_s)
-            loss_s0 = criterion(self.C0(self.D0(feat_s)), label_s)
-            loss_s1 = criterion(self.C1(self.D1(feat_s)), label_s)
-            loss_s2 = criterion(self.C2(self.D2(feat_s)), label_s)
-            loss_s = loss_s0 + loss_s1 + loss_s2
+                if batch_idx % self.interval == 0:
+                    # ================================== #
+                    for key, val in class_loss.items():
+                        self.logger.add_scalar(
+                            "class_loss/%s" % key, val,
+                            global_step=batch_idx)
 
-            loss_s.backward()
-            self.group_step([self.opt_g, self.opt_c0, self.opt_c1, self.opt_c2, self.opt_d0,self.opt_d1,self.opt_d2])
+                    for key, val in confusion_loss.items():
+                        self.logger.add_scalar(
+                            "confusion_loss/%s" % key, val,
+                            global_step=batch_idx)
 
+                    for key, val in rec_loss_src.items():
+                        self.logger.add_scalar(
+                            "rec_loss_src/%s" % key, val,
+                            global_step=batch_idx)
 
-            loss_s0 = criterion(self.C0(self.D0(self.G(img_s))),label_s)
-            loss_s1 = criterion(self.C1(self.D1(self.G(img_s))),label_s)
-            loss_dis = self.discrepancy(self.C0(self.D0(self.G(img_t))),self.C1(self.D1(self.G(img_t))))
-            loss = loss_s0 + loss_s1 - loss_dis
-            loss.backward()
-            self.group_step([self.opt_d0,self.opt_d1,self.opt_c0,self.opt_c1])
+                    for key, val in rec_loss_trg.items():
+                        self.logger.add_scalar(
+                            "rec_loss_trg/%s" % key, val,
+                            global_step=batch_idx)
 
-            #ring loss
-            data = torch.cat((img_s, img_t), 0)
-            feat = self.G(data)
-            ring_loss = self.ring_loss(feat)
-            ring_loss.backward()
-            self.group_step([self.opt_g])
+                    self.logger.add_scalar(
+                        "extra_loss/alignment_loss1", alignment_loss1,
+                        global_step=batch_idx)
 
+                    self.logger.add_scalar(
+                        "extra_loss/alignment_loss2", alignment_loss2,
+                        global_step=batch_idx)
 
+                    self.logger.add_scalar(
+                        "extra_loss/discrepancy_ds_di_trg", discrepancy_loss,
+                        global_step=batch_idx)
 
-
-            # minimize mutual information between (d0, d2) and (d1, d2)
-            for i in range(0, self.mi_k):
-                output_d0_s, output_d0_t = self.D0(self.G(img_s)), self.D0(self.G(img_t))
-                output_d1_s, output_d1_t = self.D1(self.G(img_s)), self.D1(self.G(img_t))
-                output_d2_s, output_d2_t = self.D2(self.G(img_s)), self.D2(self.G(img_t))
-                output_d2_s_shuffle = torch.index_select(output_d2_s,0,Variable(torch.randperm(output_d2_s.shape[0]).cuda()))
-                output_d2_t_shuffle = torch.index_select(output_d2_t, 0, Variable(torch.randperm(output_d2_t.shape[0]).cuda()))
-
-                MI_d0d2_s = self.mutual_information_estimator(output_d0_s, output_d2_s, output_d2_s_shuffle)
-                MI_d0d2_t = self.mutual_information_estimator(output_d0_t, output_d2_t, output_d2_t_shuffle)
-                MI_d1d2_s = self.mutual_information_estimator(output_d1_s, output_d2_s, output_d2_s_shuffle)
-                MI_d1d2_t = self.mutual_information_estimator(output_d1_t, output_d2_t, output_d2_t_shuffle)
-                MI = 0.25*(MI_d0d2_s + MI_d0d2_t + MI_d1d2_s + MI_d1d2_t) * self.mi_para
-                MI.backward()
-                self.group_step([self.opt_d0, self.opt_d1, self.opt_d2, self.opt_mi])
-            # pred_d1d2_s = self.M(output_d1_s, output_d2_s)
-
-            # adversarial training
-            entropy_s2 = self.ent(self.C2(self.D2(self.G(img_s))))
-            entropy_t2 = self.ent(self.C2(self.D2(self.G(img_t))))
-            loss = entropy_s2+entropy_t2
-            loss.backward()
-            self.group_step([self.opt_d2, self.opt_g])
-
-
-
-            #adversarial alignment
-            src_domain_pred = self.FD(self.D1(self.G(img_s)))
-            tgt_domain_pred = self.FD(self.D1(self.G(img_t)))
-
-            df_loss_src = adv_loss(src_domain_pred, self.src_domain_code)
-            df_loss_tgt = adv_loss(tgt_domain_pred, self.tgt_domain_code)
-            loss = 0.01 * (df_loss_src + df_loss_tgt)
-            loss.backward()
-            self.group_step([self.opt_fd, self.opt_d1, self.opt_g])
-
-            src_domain_pred = self.FD(self.D1(self.G(img_s)))
-            tgt_domain_pred = self.FD(self.D1(self.G(img_t)))
-
-            df_loss_src = adv_loss(src_domain_pred, 1-self.src_domain_code)
-            df_loss_tgt = adv_loss(tgt_domain_pred, 1-self.tgt_domain_code)
-            loss = 0.01 * (df_loss_src + df_loss_tgt)
-
-            loss.backward()
-            self.group_step([self.opt_fd, self.opt_d1, self.opt_g])
-
-            for i in range(self.num_k):
-                loss_dis = self.discrepancy(self.C0(self.D0(self.G(img_t))), self.C1(self.D1(self.G(img_t))))
-                loss_dis.backward()
-                self.group_step([self.opt_g])
-
-            # reconstruction component
-            feat_s = self.G(img_s)
-            feat_t = self.G(img_t)
-
-            d0_feat_s, d1_feat_s, d2_feat_s = self.D0(feat_s), self.D1(feat_s), self.D2(feat_s)
-            d0_feat_t, d1_feat_t, d2_feat_t = self.D0(feat_t), self.D1(feat_t), self.D2(feat_t)
-            d0_d2_s =torch.cat((d0_feat_s, d2_feat_s),1)
-            d1_d2_s =torch.cat((d1_feat_s, d2_feat_s),1)
-            d0_d2_t =torch.cat((d0_feat_t, d2_feat_t),1)
-            d1_d2_t =torch.cat((d1_feat_t, d2_feat_t),1)
-
-            recon_d0_d2_s, recon_d1_d2_s = self.R(d0_d2_s), self.R(d1_d2_s)
-            recon_d0_d2_t, recon_d1_d2_t = self.R(d0_d2_t), self.R(d1_d2_t)
-
-            recon_loss = self.reconstruct_loss(feat_s, recon_d0_d2_s)
-            recon_loss += self.reconstruct_loss(feat_s, recon_d1_d2_s)
-            recon_loss += self.reconstruct_loss(feat_t, recon_d0_d2_t )
-            recon_loss += self.reconstruct_loss(feat_t, recon_d1_d2_t )
-            recon_loss = (recon_loss/4)*self.belta
-            recon_loss.backward()
-            self.group_step([self.opt_d1, self.opt_d2, self.opt_d0, self.opt_r])
-
-            if batch_idx > 500000:
-                return batch_idx
-
-            if batch_idx % self.interval == 0:
-                loss_dis = loss_s1
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss1: {:.6f}\t Loss2: {:.6f}\t  Discrepancy: {:.6f}'.format(
-                    epoch, batch_idx, 100,
-                    100. * batch_idx / 70000, loss_s1.data[0], loss_s2.data[0], loss_dis.data[0]))
-                if record_file:
-                    record = open(record_file, 'a')
-                    record.write('%s %s %s\n' % (loss_dis.data[0], loss_s1.data[0], loss_s2.data[0]))
-                    record.close()
+                    self.logger.add_scalar(
+                        "extra_loss/ring", ring_loss,
+                        global_step=batch_idx)
+                    # ================================== #
+                pbar.update()
         return batch_idx
 
 
     def test(self, epoch, record_file=None, save_model=False):
         self.G.eval()
-        self.D1.eval()
-        self.D0.eval()
-        self.C1.eval()
-        self.C0.eval()
+        self.D['di'].eval()
+        self.D['ds'].eval()
+        self.C['di'].eval()
+        self.C['ds'].eval()
         test_loss = 0
         correct1 = 0
         correct2 = 0
@@ -298,21 +365,21 @@ class Solver(object):
             img, label = img.cuda(), label.long().cuda()
             img, label = Variable(img, volatile=True), Variable(label)
             feat = self.G(img)
-            output1 = self.C1(self.D1(feat))
-            output2 = self.C0(self.D0(feat))
-            test_loss += F.nll_loss(output1, label).data[0]
-            output_ensemble = output1 + output2
-            pred1 = output1.data.max(1)[1]
-            pred2 = output2.data.max(1)[1]
-            pred_ensemble = output_ensemble.data.max(1)[1]
+            out1 = self.C['di'](self.D['di'](feat))
+            out2 = self.C['ds'](self.D['ds'](feat))
+            test_loss += F.nll_loss(out1, label).data[0]
+            out_ensemble = out1 + out2
+            predi = out1.data.max(1)[1]
+            preci = out2.data.max(1)[1]
+            pred_ensemble = out_ensemble.data.max(1)[1]
             k = label.data.size()[0]
-            correct1 += pred1.eq(label.data).cpu().sum()
-            correct2 += pred2.eq(label.data).cpu().sum()
+            correct1 += predi.eq(label.data).cpu().sum()
+            correct2 += preci.eq(label.data).cpu().sum()
             correct3 += pred_ensemble.eq(label.data).cpu().sum()
             size += k
             record = open('conf_{}.txt'.format(epoch),'a')
-            for tmp_index in range(0,len(pred1)):
-                record.write('%d %d\n'%(label.data[tmp_index], pred1[tmp_index]))
+            for tmp_index in range(0,len(predi)):
+                record.write('%d %d\n'%(label.data[tmp_index], predi[tmp_index]))
 
             record.close()
         test_loss = test_loss / size
