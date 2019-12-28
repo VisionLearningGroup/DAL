@@ -8,11 +8,11 @@ def _l2_rec(src, trg):
 
 
 def _ent(out):
-    return - torch.mean(torch.log(F.softmax(out + 1e-6)))
+    return - torch.mean(torch.log(F.softmax(out + 1e-6, dim=-1)))
 
 
 def _discrepancy(out1, out2):
-    return torch.mean(torch.abs(F.softmax(out1) - F.softmax(out2)))
+    return torch.mean(torch.abs(F.softmax(out1, dim=-1) - F.softmax(out2, dim=-1)))
 
 
 def _ring(feat, type='geman'):

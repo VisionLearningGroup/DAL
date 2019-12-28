@@ -47,6 +47,8 @@ parser.add_argument('--recordfolder', type=str, default='source_only', metavar='
 parser.add_argument('--exp_name', type=str, default='test', metavar='N')
 parser.add_argument('--gpu', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
+parser.add_argument('--use_cuda', action='store_true', default=True,
+                    help='Use cuda or not')
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()

@@ -43,7 +43,7 @@ def dataset_read(source, target, batch_size, scale=False, all_use='no'):
     domain_all.remove(source)
     (train_source, s_label_train,
      test_source, s_label_test) = return_dataset(
-         source, scale=scale,usps=usps, all_use=all_use)
+         source, scale=scale, usps=usps, all_use=all_use)
 
     (train_target, t_label_train,
      test_target, t_label_test) = return_dataset(

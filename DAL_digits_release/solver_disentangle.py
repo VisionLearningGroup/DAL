@@ -11,7 +11,6 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.autograd import Variable
 from model.build_gen import Disentangler, Generator, Classifier, Feature_Discriminator, Reconstructor, Mine
 from datasets.dataset_read import dataset_read
 from utils.utils import _l2_rec, _ent, _discrepancy, _ring
@@ -22,19 +21,23 @@ from tqdm import tqdm
 
 class Solver():
     def __init__(self, args, batch_size=64, source='svhn',
-                 target='mnist', learning_rate=0.0002, interval=10,
+                 target='mnist', learning_rate=0.0002, interval=1,
                  optimizer='adam', num_k=4, all_use=False,
                  checkpoint_dir=None, save_epoch=10):
 
         timestring = strftime("%Y-%m-%d_%H-%M-%S", gmtime()) + "_%s" % args.exp_name
         self.logdir = os.path.join('./logs', timestring)
         self.logger = SummaryWriter(log_dir=self.logdir)
+        self.device = torch.device("cuda" if args.use_cuda else "cpu")
 
-        self.src_domain_code = np.repeat(np.array([[*([1]), *([0])]]), batch_size, axis=0)
-        self.trg_domain_code = np.repeat(np.array([[*([0]), *([1])]]), batch_size, axis=0)
-        self.src_domain_code = Variable(torch.FloatTensor(self.src_domain_code).cuda(), requires_grad=False)
-        self.trg_domain_code = Variable(torch.FloatTensor(self.trg_domain_code).cuda(), requires_grad=False)
-        self.batch_size = batch_size
+        self.src_domain_code = np.repeat(
+            np.array([[*([1]), *([0])]]), batch_size, axis=0)
+        self.trg_domain_code = np.repeat(
+            np.array([[*([0]), *([1])]]), batch_size, axis=0)
+        self.src_domain_code = torch.FloatTensor(
+            self.src_domain_code).to(self.device)
+        self.trg_domain_code = torch.FloatTensor(
+            self.trg_domain_code).to(self.device)
 
         self.source = source
         self.target = target
@@ -46,10 +49,11 @@ class Solver():
         self.all_use = all_use
         self.delta = 0.01
         self.mi_coeff = 0.0001
-        if self.source == 'svhn':
-            self.scale = False
-        else:
-            self.scale = False
+        self.interval = interval
+        self.batch_size = batch_size
+        self.lr = learning_rate
+        self.scale = False
+
         print('dataset loading')
         self.datasets, self.dataset_test = dataset_read(
             source, target, self.batch_size, scale=self.scale, all_use=self.all_use)
@@ -82,8 +86,6 @@ class Solver():
             self.G.torch.load('%s/%s_to_%s_model_epoch%s_G.pt' % (
                 self.checkpoint_dir, self.source, self.target, args.resume_epoch))
 
-        self.interval = interval
-        self.lr = learning_rate
         self.xent_loss = nn.CrossEntropyLoss().cuda()
         self.adv_loss = nn.BCEWithLogitsLoss().cuda()
         self.set_optimizer(which_opt=optimizer, lr=learning_rate)
@@ -141,20 +143,18 @@ class Solver():
     def discrepancy_minimizer(self, img_src, img_trg, label_src):
         # ================================== #
         # NOTE: I'm still not sure why we need this
-        feat_src = self.G(img_src)
-        feat_trg = self.G(img_trg)
 
         _loss = dict()
         # on source domain
         _loss['ds_src'] = self.xent_loss(
-            self.C['ds'](self.D['ds'](feat_src)), label_src)
+            self.C['ds'](self.D['ds'](self.G(img_src))), label_src)
         _loss['di_src'] = self.xent_loss(
-            self.C['di'](self.D['di'](feat_src)), label_src)
+            self.C['di'](self.D['di'](self.G(img_src))), label_src)
 
         # on target domain
         _loss['discrepancy_ds_di_trg'] = _discrepancy(
-            self.C['ds'](self.D['ds'](feat_trg)),
-            self.C['di'](self.D['di'](feat_trg)))
+            self.C['ds'](self.D['ds'](self.G(img_trg))),
+            self.C['di'](self.D['di'](self.G(img_trg))))
 
         _sum_loss = sum([l for _, l in _loss.items()])
         _sum_loss.backward()
@@ -172,15 +172,14 @@ class Solver():
     def mutual_information_minimizer(self, img_src, img_trg):
         # minimize mutual information between (ds, ci) and (di, ci)
         for i in range(0, self.mi_k):
-            feat_src, feat_trg = self.G(img_src), self.G(img_trg)
-            ds_src, ds_trg = self.D['ds'](feat_src), self.D['ds'](feat_trg)
-            di_src, di_trg = self.D['di'](feat_src), self.D['di'](feat_trg)
-            ci_src, ci_trg = self.D['ci'](feat_src), self.D['ci'](feat_trg)
+            ds_src, ds_trg = self.D['ds'](self.G(img_src)), self.D['ds'](self.G(img_trg))
+            di_src, di_trg = self.D['di'](self.G(img_src)), self.D['di'](self.G(img_trg))
+            ci_src, ci_trg = self.D['ci'](self.G(img_src)), self.D['ci'](self.G(img_trg))
 
             ci_src_shuffle = torch.index_select(
-                ci_src, 0, Variable(torch.randperm(ci_src.shape[0]).cuda()))
+                ci_src, 0, torch.randperm(ci_src.shape[0]).to(self.device))
             ci_trg_shuffle = torch.index_select(
-                ci_trg, 0, Variable(torch.randperm(ci_trg.shape[0]).cuda()))
+                ci_trg, 0, torch.randperm(ci_trg.shape[0]).to(self.device))
 
             MI_ds_ci_src = self.mi_estimator(ds_src, ci_src, ci_src_shuffle)
             MI_ds_ci_trg = self.mi_estimator(ds_trg, ci_trg, ci_trg_shuffle)
@@ -275,7 +274,7 @@ class Solver():
         for k in self.D.keys():
             self.D[k].train()
 
-        torch.cuda.manual_seed(1)
+        # torch.cuda.manual_seed(1)
         total_batches = 500000
         pbar_descr_prefix = "Epoch %d" % (epoch)
         with tqdm(total=total_batches, ncols=80, dynamic_ncols=False,
@@ -284,18 +283,14 @@ class Solver():
                 if batch_idx > total_batches:
                     return batch_idx
 
-                img_trg = data['T']
-                img_src = data['S']
-                label_src = data['S_label']
+                img_trg = data['T'].to(self.device)
+                img_src = data['S'].to(self.device)
+                label_src = data['S_label'].long().to(self.device)
+
                 if img_src.size()[0] < self.batch_size or img_trg.size()[0] < self.batch_size:
                     break
-                img_src = img_src.cuda()
-                img_trg = img_trg.cuda()
-                label_src = Variable(label_src.long().cuda())
-                img_src = Variable(img_src)
-                img_trg = Variable(img_trg)
-                self.reset_grad()
 
+                self.reset_grad()
                 # ================================== #
                 class_loss = self.optimize_classifier(img_src, label_src)
                 ring_loss = self.ring_loss_minimizer(img_src, img_trg)
@@ -355,40 +350,58 @@ class Solver():
         self.C['di'].eval()
         self.C['ds'].eval()
         test_loss = 0
-        correct1 = 0
-        correct2 = 0
-        correct3 = 0
         size = 0
-        for batch_idx, data in enumerate(self.dataset_test):
-            img = data['T']
-            label = data['T_label']
-            img, label = img.cuda(), label.long().cuda()
-            img, label = Variable(img, volatile=True), Variable(label)
-            feat = self.G(img)
-            out1 = self.C['di'](self.D['di'](feat))
-            out2 = self.C['ds'](self.D['ds'](feat))
-            test_loss += F.nll_loss(out1, label).data[0]
-            out_ensemble = out1 + out2
-            predi = out1.data.max(1)[1]
-            preci = out2.data.max(1)[1]
-            pred_ensemble = out_ensemble.data.max(1)[1]
-            k = label.data.size()[0]
-            correct1 += predi.eq(label.data).cpu().sum()
-            correct2 += preci.eq(label.data).cpu().sum()
-            correct3 += pred_ensemble.eq(label.data).cpu().sum()
-            size += k
-            record = open('conf_{}.txt'.format(epoch),'a')
-            for tmp_index in range(0,len(predi)):
-                record.write('%d %d\n'%(label.data[tmp_index], predi[tmp_index]))
+        correct1, correct2, correct3 = 0, 0, 0
+        with torch.no_grad():
+            for batch_idx, data in enumerate(self.dataset_test):
+                img, label = data['T'], data['T_label'].long()
+                img, label = img.to(self.device), label.to(self.device)
 
-            record.close()
+                feat = self.G(img)
+                out1 = self.C['di'](self.D['di'](feat))
+                out2 = self.C['ds'](self.D['ds'](feat))
+                test_loss += F.nll_loss(out1, label).item()
+
+                out_ensemble = out1 + out2
+                predi = out1.data.max(1)[1]
+                preci = out2.data.max(1)[1]
+                pred_ensemble = out_ensemble.data.max(1)[1]
+
+                k = label.data.size()[0]
+                correct1 += predi.eq(label.data).cpu().sum()
+                correct2 += preci.eq(label.data).cpu().sum()
+                correct3 += pred_ensemble.eq(label.data).cpu().sum()
+                size += k
+                # record = open('conf_{}.txt'.format(epoch), 'a')
+                # for tmp_index in range(0, len(predi)):
+                #     record.write('%d %d\n' % (label.data[tmp_index], predi[tmp_index]))
+                # record.close()
+
         test_loss = test_loss / size
-        print(
-            '\nTest set: Average loss: {:.4f}, Accuracy C1: {}/{} ({:.0f}%) Accuracy C2: {}/{} ({:.0f}%) Accuracy Ensemble: {}/{} ({:.0f}%) \n'.format(
-                test_loss, correct1, size,
-                100. * correct1 / size, correct2, size, 100. * correct2 / size, correct3, size, 100. * correct3 / size))
-        if record_file:
-            record = open(record_file, 'a')
-            print('recording %s', record_file)
-            record.write('%s %s %s\n' % (float(correct1) / size, float(correct2) / size, float(correct3) / size))
-            record.close()
+        acc1 = 100. * correct1 / size
+        acc2 = 100. * correct2 / size
+        acc3 = 100. * correct3 / size
+
+        print('\nTest set: Average loss: {:.4f}, Accuracy C1: {}/{} ({:.0f}%) Accuracy C2: {}/{} ({:.0f}%) Accuracy Ensemble: {}/{} ({:.0f}%) \n'.format(
+            test_loss,
+            correct1, size, acc1,
+            correct2, size, acc2,
+            correct3, size, acc3))
+
+        self.logger.add_scalar(
+            "test_target_acc/di", acc1,
+            global_step=epoch)
+
+        self.logger.add_scalar(
+            "test_target_acc/ds", acc2,
+            global_step=epoch)
+
+        self.logger.add_scalar(
+            "test_target_acc/max_ensemble", acc3,
+            global_step=epoch)
+
+        # if record_file:
+        #     record = open(record_file, 'a')
+        #     print('recording %s', record_file)
+        #     record.write('%s %s %s\n' % (float(correct1) / size, float(correct2) / size, float(correct3) / size))
+        #     record.close()
